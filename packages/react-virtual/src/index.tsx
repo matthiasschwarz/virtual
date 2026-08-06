@@ -9,12 +9,18 @@ import {
   observeWindowRect,
   windowScroll,
 } from '@tanstack/virtual-core'
-import type { PartialKeys, VirtualizerOptions } from '@tanstack/virtual-core'
+import type {
+  PartialKeys,
+  VirtualItem,
+  VirtualizerOptions,
+} from '@tanstack/virtual-core'
 
 export * from '@tanstack/virtual-core'
 
 const useIsomorphicLayoutEffect =
   typeof document !== 'undefined' ? React.useLayoutEffect : React.useEffect
+
+type VirtualItemKey = VirtualItem['key']
 
 export type ReactVirtualizer<
   TScrollElement extends Element | Window,
@@ -26,6 +32,13 @@ export type ReactVirtualizer<
    * main-axis size (`height` or `width`) directly to skip React re-renders.
    */
   containerRef: (node: HTMLElement | null) => void
+  /**
+   * Ref callback for additional elements positioned by `directDomUpdates`.
+   * These elements are not measured or observed.
+   */
+  layoutElement: (node: TItemElement | null) => void
+  /** Additional layout elements grouped by virtual item key. */
+  layoutElementsCache: Map<VirtualItemKey, Set<TItemElement>>
 }
 
 export type ReactVirtualizerOptions<
@@ -94,6 +107,10 @@ function useVirtualizerBase<
     // node — e.g. when `enabled` is toggled off then on) is treated as fresh
     // and gets its style written.
     lastPositions: new WeakMap<HTMLElement, number>(),
+    layoutElementsCache: new Map<VirtualItemKey, Set<TItemElement>>(),
+    layoutElementKeys: new WeakMap<TItemElement, VirtualItemKey>(),
+    needsLayoutElementFlush: false,
+    isMounted: false,
     prevRange: null as {
       startIndex: number
       endIndex: number
@@ -125,14 +142,55 @@ function useVirtualizerBase<
     }
   }
 
+  const getItemKeyFromElement = (
+    instance: Virtualizer<TScrollElement, TItemElement>,
+    element: TItemElement,
+  ) => {
+    const index = instance.indexFromElement(element)
+    return index >= 0 && index < instance.options.count
+      ? instance.options.getItemKey(index)
+      : undefined
+  }
+
+  const setLayoutElementKey = (
+    element: TItemElement,
+    nextKey: VirtualItemKey | undefined,
+  ) => {
+    const state = directRef.current
+    const previousKey = state.layoutElementKeys.get(element)
+
+    if (previousKey !== undefined && previousKey !== nextKey) {
+      const elements = state.layoutElementsCache.get(previousKey)
+      elements?.delete(element)
+      if (elements?.size === 0) {
+        state.layoutElementsCache.delete(previousKey)
+      }
+    }
+
+    if (nextKey === undefined) {
+      state.layoutElementKeys.delete(element)
+      return
+    }
+
+    let elements = state.layoutElementsCache.get(nextKey)
+    if (!elements) {
+      elements = new Set<TItemElement>()
+      state.layoutElementsCache.set(nextKey, elements)
+    }
+
+    elements.add(element)
+    state.layoutElementKeys.set(element, nextKey)
+  }
+
   // Writes container size + item positions to the DOM. Idempotent — guarded
   // by lastSize / lastPositions. Called from onChange (covers scroll-driven
-  // updates) and from a layout effect (covers post-render commits when refs
-  // have just registered new items in elementsCache).
+  // updates), from a layout effect (covers post-render commits), and from a
+  // deferred layout-element flush (covers descendant-only commits).
   const applyDirectStyles = (
     instance: Virtualizer<TScrollElement, TItemElement>,
   ) => {
     const state = directRef.current
+
     if (!state.enabled || !state.container) return
 
     applyContainerSize(instance)
@@ -141,13 +199,14 @@ function useVirtualizerBase<
     const useTransform = state.mode === 'transform'
     const posAxis = horizontal ? 'left' : 'top'
     const scrollMargin = instance.options.scrollMargin
-    const items = instance.getVirtualItems()
-    for (const item of items) {
-      const next = item.start - scrollMargin
-      const el = instance.elementsCache.get(item.key) as HTMLElement | undefined
-      if (!el) continue
-      if (state.lastPositions.get(el) === next) continue
+    const hasLayoutElements = state.layoutElementsCache.size > 0
+
+    const writePosition = (element: TItemElement, next: number) => {
+      const el = element as unknown as HTMLElement
+      if (state.lastPositions.get(el) === next) return
+
       state.lastPositions.set(el, next)
+
       if (useTransform) {
         el.style.transform = horizontal
           ? `translate3d(${next}px, 0, 0)`
@@ -156,6 +215,71 @@ function useVirtualizerBase<
         el.style[posAxis] = `${next}px`
       }
     }
+
+    for (const item of instance.getVirtualItems()) {
+      const next = item.start - scrollMargin
+      const measuredElement = instance.elementsCache.get(item.key)
+
+      if (measuredElement) {
+        writePosition(measuredElement, next)
+      }
+
+      if (!hasLayoutElements) continue
+      const layoutElements = state.layoutElementsCache.get(item.key)
+      if (!layoutElements) continue
+
+      for (const layoutElement of layoutElements) {
+        writePosition(layoutElement, next)
+      }
+    }
+  }
+
+  // Reconcile key changes and disconnected elements after the commit.
+  const reconcileLayoutElements = (
+    instance: Virtualizer<TScrollElement, TItemElement>,
+  ) => {
+    const state = directRef.current
+    if (state.layoutElementsCache.size > 0) {
+      // Re-keying is rare; defer re-adding to keep new keys out of this pass.
+      const movedElements: Array<[TItemElement, VirtualItemKey]> = []
+      for (const [key, elements] of state.layoutElementsCache) {
+        for (const element of elements) {
+          const nextKey = element.isConnected
+            ? getItemKeyFromElement(instance, element)
+            : undefined
+          if (nextKey === key) continue
+
+          setLayoutElementKey(element, undefined)
+          if (nextKey !== undefined) {
+            movedElements.push([element, nextKey])
+          }
+        }
+      }
+      for (const [element, key] of movedElements) {
+        setLayoutElementKey(element, key)
+      }
+    }
+  }
+
+  const scheduleLayoutElementFlush = (
+    instance: Virtualizer<TScrollElement, TItemElement>,
+  ) => {
+    const state = directRef.current
+    if (state.needsLayoutElementFlush) return
+
+    state.needsLayoutElementFlush = true
+    queueMicrotask(() => {
+      if (!state.needsLayoutElementFlush) return
+      state.needsLayoutElementFlush = false
+
+      if (!state.isMounted) {
+        state.layoutElementsCache.clear()
+        return
+      }
+
+      reconcileLayoutElements(instance)
+      applyDirectStyles(instance)
+    })
   }
 
   const resolvedOptions: VirtualizerOptions<TScrollElement, TItemElement> = {
@@ -212,13 +336,28 @@ function useVirtualizerBase<
           node.style[axis] = `${total}px`
         }
       },
+      layoutElement: (node: TItemElement | null) => {
+        if (node) {
+          setLayoutElementKey(node, getItemKeyFromElement(v, node))
+        }
+        scheduleLayoutElementFlush(v)
+      },
+      layoutElementsCache: directRef.current.layoutElementsCache,
     })
   })
 
   instance.setOptions(resolvedOptions)
 
   useIsomorphicLayoutEffect(() => {
-    return instance._didMount()
+    directRef.current.isMounted = true
+    const cleanup = instance._didMount()
+
+    return () => {
+      directRef.current.isMounted = false
+      // Defer clearing so StrictMode can replay the mount first.
+      scheduleLayoutElementFlush(instance)
+      cleanup?.()
+    }
   }, [])
 
   useIsomorphicLayoutEffect(() => {
@@ -232,10 +371,13 @@ function useVirtualizerBase<
     return instance._willUpdate()
   })
 
-  // After every render commit, newly mounted item refs have registered in
-  // elementsCache; write their positions to the DOM so the user doesn't see
-  // them at (0, 0) until the next onChange.
+  // After every render commit, newly mounted refs have registered in
+  // elementsCache / layoutElementsCache; reconcile layout-element keys and
+  // write positions to the DOM so the user doesn't see elements at (0, 0)
+  // until the next onChange.
   useIsomorphicLayoutEffect(() => {
+    directRef.current.needsLayoutElementFlush = false
+    reconcileLayoutElements(instance)
     applyDirectStyles(instance)
   })
 

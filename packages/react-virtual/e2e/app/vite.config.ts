@@ -21,6 +21,7 @@ export default defineConfig({
           __dirname,
           'direct-dom-updates/index.html',
         ),
+        'layout-element': path.resolve(__dirname, 'layout-element/index.html'),
         'cached-measurements': path.resolve(
           __dirname,
           'cached-measurements/index.html',
